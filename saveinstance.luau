@@ -263,8 +263,9 @@ local function stripDecompilerNoise(source)
 	local changed = false
 
 	for i = 1, #lines do
-		if string.match(lines[i], "^:%d+: ") then
-			lines[i] = "-- decompiler said " .. lines[i]
+		local indent, body = string.match(lines[i], "^(%s*)(:%d+: .*)$")
+		if indent then
+			lines[i] = indent .. "-- decompiler said " .. body
 			changed = true
 		end
 	end
@@ -278,6 +279,33 @@ local function stripDecompilerNoise(source)
 		joined = string.sub(joined, 1, -2)
 	end
 	return joined
+end
+
+-- * "Expected identifier when parsing method name, got X" means a method call
+-- * lost its name. Luau reports it on the colon, so drop that colon instead of
+-- * guessing at the whitespace around it.
+local function repairDanglingColon(source, err)
+	local lineNo = tonumber(string.match(err or "", ":(%d+):"))
+	if not lineNo then
+		return source
+	end
+
+	local lines = splitLines(source)
+	for i = lineNo, math.max(1, lineNo - 3), -1 do
+		local line = lines[i]
+		local trimmed = string.gsub(line, "%s+$", "")
+		local at = string.find(trimmed, ":%s*$")
+		if at then
+			lines[i] = string.sub(trimmed, 1, at - 1) .. string.sub(line, #trimmed + 1)
+			return table.concat(lines, "\n")
+		end
+		at = string.find(trimmed, ":%s*%-%-")
+		if at then
+			lines[i] = string.sub(trimmed, 1, at - 1)
+			return table.concat(lines, "\n")
+		end
+	end
+	return source
 end
 
 -- * nil when the chunk compiles (or when validation is impossible), else the message.
@@ -439,6 +467,11 @@ local function processDecompiledSource(source, options)
 	local status = "valid"
 	local applied
 
+	if err and options.Repair and string.find(err, "parsing method name") then
+		source = repairDanglingColon(source, err)
+		err = compileError(source)
+	end
+
 	if err and options.Repair then
 		local repaired, repairs = repairSource(source)
 		if #repairs > 0 then
@@ -453,10 +486,34 @@ local function processDecompiledSource(source, options)
 	end
 
 	if err then
-		local lineNo = tonumber(string.match(err, ":(%d+):"))
-		source = commentOutBrokenLine(source, lineNo)
-		status = "broken (line " .. tostring(lineNo or "?") .. " commented out)"
-		source = longComment(" DECOMPILER SYNTAX ERROR: " .. err .. "\n") .. "\n" .. source
+		local firstErr = err
+		local checkErr = err
+		local quarantined = 0
+
+		-- * Keep commenting until the chunk compiles or the line stops moving.
+		while checkErr and quarantined < 5 do
+			local lineNo = tonumber(string.match(checkErr, ":(%d+):"))
+			if not lineNo then
+				break
+			end
+			local before = source
+			source = commentOutBrokenLine(source, lineNo)
+			if source == before then
+				break
+			end
+			quarantined += 1
+			checkErr = compileError(source)
+		end
+
+		if checkErr then
+			status = "broken (quarantined " .. quarantined .. " line(s), still invalid)"
+			err = checkErr
+		else
+			status = "repaired (quarantined " .. quarantined .. " line(s))"
+			err = firstErr
+		end
+
+		source = longComment(" DECOMPILER SYNTAX ERROR: " .. firstErr .. "\n") .. "\n" .. source
 	elseif options.Clean then
 		local cleaned = cleanSource(source)
 		if cleaned ~= source and not compileError(cleaned) then
