@@ -145,6 +145,25 @@ local LOADSTRING = loadstring
 local VALIDATE_MAX = 2 * 1024 * 1024
 local CLEAN_MAX = 1024 * 1024
 
+local PIPELINE_ERRORS = {}
+local PIPELINE_ERROR_MAX = 200
+
+-- * Never abort a save because one script misbehaved. Log, count, move on.
+local function recordPipelineError(where, err)
+	if #PIPELINE_ERRORS >= PIPELINE_ERROR_MAX then
+		return
+	end
+	local name = tostring(where)
+	local ok, full = pcall(function()
+		return where:GetFullName()
+	end)
+	if ok and full then
+		name = full
+	end
+	PIPELINE_ERRORS[#PIPELINE_ERRORS + 1] = name .. " :: " .. string.gsub(tostring(err), "[\r\n]+", " ")
+	warn("[saveinstance] pipeline error:", name, err)
+end
+
 -- * Level-aware long comment; never breaks on `]]` inside the payload.
 local function longComment(text)
 	local level = 0
@@ -336,19 +355,37 @@ local function cleanSource(source)
 	source = string.gsub(source, "\n[ \t]*do[ \t]+end[ \t]*\n", "\n")
 	source = string.gsub(source, "([ \t])end;", "%1end")
 
-	-- * Declaration-only locals: count == 1 means nothing else mentions them.
-	local dead = {}
+	-- * One token frequency map instead of a full scan per candidate name.
+	local frequency = {}
+	for token in string.gmatch(source, "[%a_][%w_]*") do
+		frequency[token] = (frequency[token] or 0) + 1
+	end
+
+	local removed = 0
 	for name in string.gmatch(source, "\n[ \t]*local%s+([%a_][%w_]*)%s*\n") do
-		if not dead[name] and countOccurrences(source, name) == 1 then
-			dead[name] = true
-			source = string.gsub(source, "\n[ \t]*local%s+" .. name .. "%s*\n", "\n")
+		if removed >= 150 then
+			break
+		end
+		if frequency[name] == 1 then
+			frequency[name] = 0
+			local out = string.gsub(source, "\n[ \t]*local%s+" .. name .. "%s*\n", "\n")
+			if out ~= source then
+				source = out
+				removed += 1
+			end
 		end
 	end
 
-	-- * l__Foo__1 -> Foo, but only while `Foo` is still unused in the file.
+	-- * l__Foo__1 -> Foo, only while `Foo` never appears at all.
+	local renamed = 0
 	for junk, base in string.gmatch(source, "local%s+(l__([%a_][%w_]*)__%d+)%s*=") do
-		if countOccurrences(source, base) == 0 then
+		if renamed >= 150 then
+			break
+		end
+		if not frequency[base] then
 			source = string.gsub(source, identifierPattern(junk), base)
+			frequency[base] = 1
+			renamed += 1
 		end
 	end
 
@@ -357,6 +394,13 @@ end
 
 -- * Returns source, status, error, repairs
 local function processDecompiledSource(source, options)
+	if not options.Validate then
+		if options.Clean then
+			return cleanSource(source), "cleaned (unvalidated)"
+		end
+		return source, "unvalidated"
+	end
+
 	local err = compileError(source)
 	local status = "valid"
 	local applied
@@ -3925,6 +3969,7 @@ end
 --- @field SourceCache {[Instance]: string} | false -- Source text to use for these scripts as-is instead of decompiling them. ___Default:___ false
 --- @field DecompileJobless boolean -- Only use scripts that are already in the decompile cache. Missing scripts get a short not-found message. This turns on `scriptcache`. ___Default:___ false
 --- @field CleanDecompiledCode boolean -- Run the cosmetic cleanup pass on decompiled output (trailing whitespace, blank-line runs, dead local declarations, l__Name__1 junk names). A cleanup is only kept if the result still compiles. ___Default:___ true
+--- @field DecompileValidate boolean -- Compile every decompiled body with loadstring so broken output can be repaired or quarantined. Turning this off skips the repair pass entirely and is the single biggest speed lever. ___Default:___ true
 --- @field ServerScriptMap boolean -- Emit a SERVER_RECONSTRUCTION script listing the server-side layout inferred from client code (looked-up paths, remotes fired/listened to, modules required) with the referencing script and line. Server scripts themselves never replicate. ___Default:___ true
 --- @field scriptcache boolean -- If the executor supports `getscriptbytecode`, cache decompiled code. This avoids decompiling the same script twice. The cache stays after the script reloads. ___Default:___ true
 --- @field RecoverScriptsFromAssets boolean -- Recover the original `Source` of scripts that were published as assets. Changes made after publishing are not included. ___Default:___ true
@@ -4087,6 +4132,7 @@ local function synsaveinstance(...)
 		DecompileTimeout = 10,
 		DecompileJobless = false,
 		CleanDecompiledCode = true,
+		DecompileValidate = true,
 		ServerScriptMap = true,
 		RecoverScriptsFromAssets = true,
 		-- decomptype = "",
@@ -5077,6 +5123,7 @@ local function synsaveinstance(...)
 	local processOptions = {
 		Repair = true,
 		Clean = OPTIONS.CleanDecompiledCode,
+		Validate = OPTIONS.DecompileValidate,
 	}
 
 	local function cacheEntry(output, status, err)
@@ -5127,6 +5174,7 @@ local function synsaveinstance(...)
 				return "-- Not found in already decompiled ScriptCache", "missing"
 			end
 
+			local startedAt = os.clock()
 			local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
 			if not result or result == "" then
 				ok, result = false, (result == "" and "Empty Output" or "No Output")
@@ -5134,11 +5182,26 @@ local function synsaveinstance(...)
 
 			local output, status, err
 			if ok then
-				result = escapeNuls(result)
-				local repairs
-				output, status, err, repairs = processDecompiledSource(result, processOptions)
-				if repairs and #repairs > 0 and __DEBUG_MODE then
-					__DEBUG_MODE("Repaired", script:GetFullName(), table.concat(repairs, ", "))
+				local pipelineOk, pipelineErr = pcall(function()
+					result = escapeNuls(result)
+					local repairs
+					output, status, err, repairs = processDecompiledSource(result, processOptions)
+					if __DEBUG_MODE then
+						__DEBUG_MODE(
+							string.format("pipeline %.2fs %d bytes %s", os.clock() - startedAt, #result, status),
+							script:GetFullName()
+						)
+						if repairs and #repairs > 0 then
+							__DEBUG_MODE("Repaired", script:GetFullName(), table.concat(repairs, ", "))
+						end
+					end
+				end)
+
+				if not pipelineOk then
+					status = "failed (pipeline threw)"
+					err = tostring(pipelineErr)
+					output = longComment(" Decompile pipeline threw:\n" .. err .. "\n")
+					recordPipelineError(script, err)
 				end
 			else
 				status = "failed"
@@ -5445,24 +5508,29 @@ local function synsaveinstance(...)
 			local scriptPath = instance:GetFullName()
 			local lineNo = 0
 
-			for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
-				lineNo += 1
-				if #line > 0 and #line <= 400 then
-					for _, rule in SCAN do
-						local first, second = string.match(line, rule.pattern)
-						if first then
-							local target
-							if rule.child then
-								target = normalizeTarget(first .. "." .. second, "path")
-							else
-								target = normalizeTarget(first, rule.kind)
-							end
-							if target then
-								addRef(target, rule.kind, scriptPath, lineNo, string.sub(line, 1, 160))
+			local scanOk, scanErr = pcall(function()
+				for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+					lineNo += 1
+					if #line > 0 and #line <= 400 then
+						for _, rule in SCAN do
+							local first, second = string.match(line, rule.pattern)
+							if first then
+								local target
+								if rule.child then
+									target = normalizeTarget(first .. "." .. second, "path")
+								else
+									target = normalizeTarget(first, rule.kind)
+								end
+								if target then
+									addRef(target, rule.kind, scriptPath, lineNo, string.sub(line, 1, 160))
+								end
 							end
 						end
 					end
 				end
+			end)
+			if not scanOk then
+				recordPipelineError(scriptPath, scanErr)
 			end
 		end
 
@@ -6826,6 +6894,13 @@ local function synsaveinstance(...)
 ]]
 				end
 
+				local pipelineErrorNote = ""
+				if #PIPELINE_ERRORS > 0 then
+					pipelineErrorNote = "\t\t!! DECOMPILE PIPELINE ERRORS !!\n\t\tThese scripts failed inside post-processing and were saved as comments only:\n\t\t"
+						.. table.concat(PIPELINE_ERRORS, "\n\t\t")
+						.. "\n\n"
+				end
+
 				return table.concat({
 					"--[[\n",
 					"\t\tThank you for using UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n",
@@ -6835,6 +6910,7 @@ local function synsaveinstance(...)
 					writerFailureHeader,
 					binaryNote,
 					helpText,
+					pipelineErrorNote,
 					service.HttpService:JSONEncode(OPTIONS),
 					metaFooter,
 					"\n]]",
@@ -6846,7 +6922,15 @@ local function synsaveinstance(...)
 		local mapExtra
 		if ServerMap then
 			mapExtra = register_extra("SERVER_RECONSTRUCTION", nil, nil, "Script", function()
-				return mapCtx and buildServerMapReport(mapCtx) or "-- Server map unavailable."
+				if not mapCtx then
+					return "-- Server map unavailable."
+				end
+				local mapOk, mapReport = pcall(buildServerMapReport, mapCtx)
+				if mapOk and type(mapReport) == "string" then
+					return mapReport
+				end
+				recordPipelineError("SERVER_RECONSTRUCTION", mapReport)
+				return "-- Server map failed: " .. tostring(mapReport)
 			end)
 		end
 
