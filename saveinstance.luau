@@ -250,6 +250,36 @@ local function splitLines(source)
 	return lines
 end
 
+-- * Some decompilers paste their own parse error into the output as a bare
+-- * ":16: Expected identifier ..." line, which is never valid Luau. Blank it
+-- * in place so line numbers stay aligned with the rest of the body.
+local function stripDecompilerNoise(source)
+	if not string.find(source, ":%d+: ", 1) then
+		return source
+	end
+
+	local hadTrailing = string.sub(source, -1) == "\n"
+	local lines = splitLines(source)
+	local changed = false
+
+	for i = 1, #lines do
+		if string.match(lines[i], "^:%d+: ") then
+			lines[i] = "-- decompiler said " .. lines[i]
+			changed = true
+		end
+	end
+
+	if not changed then
+		return source
+	end
+
+	local joined = table.concat(lines, "\n")
+	if not hadTrailing and string.sub(joined, -1) == "\n" then
+		joined = string.sub(joined, 1, -2)
+	end
+	return joined
+end
+
 -- * nil when the chunk compiles (or when validation is impossible), else the message.
 local function compileError(source)
 	if not LOADSTRING or #source > VALIDATE_MAX then
@@ -396,6 +426,8 @@ end
 
 -- * Returns source, status, error, repairs
 local function processDecompiledSource(source, options)
+	source = stripDecompilerNoise(source)
+
 	if not options.Validate then
 		if options.Clean then
 			return cleanSource(source), "cleaned (unvalidated)"
@@ -5427,9 +5459,41 @@ local function synsaveinstance(...)
 		local topChildren = rootOverride.__Children
 
 		local folders = {}
+		local leavesByPath = {}
 		local leaves = 0
-		local refLines = {}
 		local unresolved = 0
+
+		local function normalizeTarget(raw, kind)
+			raw = string.gsub(raw, "%s+", "")
+			if raw == "" then
+				return nil
+			end
+			if kind == "require" or kind == "service" then
+				return "game." .. raw
+			end
+			if string.sub(raw, 1, 5) == "game." then
+				return raw
+			end
+			local tail = string.match(raw, "([%w_]+)$")
+			if not tail or tail == "game" then
+				return nil
+			end
+			return tail
+		end
+
+		local SCAN = {
+			{ kind = "service", pattern = 'GetService%(%s*["\']([%w_]+)["\']' },
+			{ kind = "WaitForChild", pattern = '([%w_%.]+):WaitForChild%s*%(%s*["\']([^"\'\r\n]+)["\']', child = true },
+			{ kind = "FindFirstChild", pattern = '([%w_%.]+):FindFirstChild%s*%(%s*["\']([^"\'\r\n]+)["\']', child = true },
+			{ kind = "FindFirstChildOfClass", pattern = 'FindFirstChildOfClass%s*%(%s*["\']([%w_]+)["\']' },
+			{ kind = "require", pattern = "require%s*%(%s*game%.([%w_%.]+)" },
+			{ kind = "FireServer", pattern = "([%w_%.%[%]\"'_:]+):FireServer%s*%(" },
+			{ kind = "InvokeServer", pattern = "([%w_%.%[%]\"'_:]+):InvokeServer%s*%(" },
+			{ kind = "OnClientEvent", pattern = "([%w_%.%[%]\"'_:]+):OnClientEvent" },
+			{ kind = "OnServerEvent", pattern = "([%w_%.%[%]\"'_:]+):OnServerEvent" },
+			{ kind = "FireAllClients", pattern = "([%w_%.%[%]\"'_:]+):FireAllClients" },
+			{ kind = "Bindable", pattern = "Instance%.new%s*%(%s*[\"']Bindable[%w]*[\"']" },
+		}
 
 		local function sanitize(name)
 			name = string.gsub(name, "[^%w_ ]", "_")
@@ -5487,6 +5551,14 @@ local function synsaveinstance(...)
 		end
 
 		local function resolveLeaf(path)
+			local existing = leavesByPath[path]
+			if existing then
+				return existing
+			end
+			if leaves >= SERVER_MAP_MAX then
+				return nil
+			end
+
 			local segments = {}
 			for segment in string.gmatch(path, "[^%.]+") do
 				if segment ~= "game" then
@@ -5514,20 +5586,21 @@ local function synsaveinstance(...)
 				parent = folder(InstancesOverrides[parent].__Children, key, segments[i])
 			end
 
-			local leafName = segments[#segments]
 			local leaf = {}
 			InstancesOverrides[leaf] = {
 				__ClassName = "Script",
 				__Virtual = "Script",
 				__Children = {},
-				Properties = { Name = sanitize(leafName), Source = "" },
+				Properties = { Name = sanitize(segments[#segments]), Source = "" },
 			}
 			InstancesOverrides[leaf].__Path = path
 			InstancesOverrides[parent].__Children[#InstancesOverrides[parent].__Children + 1] = leaf
+			leavesByPath[path] = leaf
 			leaves += 1
 			return leaf
 		end
 
+		local refLines = {}
 		local scanned = 0
 
 		for _, instance in ctx.ordered do
@@ -5567,7 +5640,7 @@ local function synsaveinstance(...)
 								else
 									target = normalizeTarget(first, rule.kind)
 								end
-								if target and leaves < SERVER_MAP_MAX then
+								if target then
 									local leaf = resolveLeaf(target)
 									if leaf then
 										refLines[leaf] = refLines[leaf] or {}
@@ -5610,7 +5683,12 @@ local function synsaveinstance(...)
 		summary[#summary + 1] = "-- Server scripts do not replicate, so this tree is inferred from client code."
 		summary[#summary + 1] = "-- Each Script below sits where the target roughly belongs and lists what calls it."
 		summary[#summary + 1] = "--"
-		summary[#summary + 1] = string.format("-- Scanned %d script(s), built %d file(s), %d unresolved.", scanned, leaves, unresolved)
+		summary[#summary + 1] = string.format(
+			"-- Scanned %d script(s), built %d file(s), %d unresolved.",
+			scanned,
+			leaves,
+			unresolved
+		)
 
 		local visible = {}
 		for _, instance in ctx.ordered do
