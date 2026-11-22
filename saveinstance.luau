@@ -138,6 +138,260 @@ local function index(self, index_name)
 	return self[index_name]
 end
 
+-- * Decompiler post-processing pipeline: validate -> repair -> clean -> quarantine.
+-- * Everything here is pure string work so it stays cheap and side-effect free.
+
+local LOADSTRING = loadstring
+local VALIDATE_MAX = 2 * 1024 * 1024
+local CLEAN_MAX = 1024 * 1024
+
+-- * Level-aware long comment; never breaks on `]]` inside the payload.
+local function longComment(text)
+	local level = 0
+	for eqs in string.gmatch(text, "%](=*)%]") do
+		if #eqs >= level then
+			level = #eqs + 1
+		end
+	end
+	local eq = string.rep("=", level)
+	return "--[" .. eq .. "[\n" .. text .. "\n]" .. eq .. "]"
+end
+
+-- * NULs are fatal to `loadstring` outside strings and fatal to the XML writer
+-- * everywhere. Escape them inside short strings, blank them everywhere else.
+-- * Long brackets and long comments are tracked so quote state stays correct.
+local function escapeNuls(source)
+	if not string_find(source, "\0") then
+		return source
+	end
+
+	local out, n = {}, 0
+	local quote, longClose
+	local i, len = 1, #source
+
+	while i <= len do
+		local c = string.sub(source, i, i)
+
+		if longClose then
+			local s, e = string_find(source, longClose, i, true)
+			if s then
+				n += 1
+				out[n] = string.gsub(string.sub(source, i, e), "\0", " ")
+				longClose = nil
+				i = e + 1
+			else
+				n += 1
+				out[n] = string.gsub(string.sub(source, i), "\0", " ")
+				i = len + 1
+			end
+		elseif quote then
+			if c == "\\" then
+				n += 1
+				out[n] = string.sub(source, i, i + 1)
+				i += 2
+			elseif c == quote or c == "\n" then
+				quote = nil
+				n += 1
+				out[n] = c
+				i += 1
+			else
+				n += 1
+				out[n] = c == "\0" and "\\0" or c
+				i += 1
+			end
+		else
+			local ls, le = string.find(source, "^%[(=*)%[", i)
+			if ls then
+				longClose = "]" .. le .. "]"
+				n += 1
+				out[n] = string.sub(source, i, i + 1 + #le)
+				i += 2 + #le
+			elseif c == '"' or c == "'" then
+				quote = c
+				n += 1
+				out[n] = c
+				i += 1
+			else
+				n += 1
+				out[n] = c == "\0" and " " or c
+				i += 1
+			end
+		end
+	end
+
+	return table.concat(out)
+end
+
+local function splitLines(source)
+	local lines, n = {}, 0
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		n += 1
+		lines[n] = line
+	end
+	return lines
+end
+
+-- * nil when the chunk compiles (or when validation is impossible), else the message.
+local function compileError(source)
+	if not LOADSTRING or #source > VALIDATE_MAX then
+		return nil
+	end
+	local ok, chunk = pcall(LOADSTRING, source)
+	if ok and chunk then
+		return nil
+	end
+	if ok then
+		return "loadstring returned no chunk"
+	end
+	return tostring(chunk)
+end
+
+local function commentOutBrokenLine(source, lineNo)
+	if not lineNo then
+		return source
+	end
+	local lines = splitLines(source)
+	if lineNo < 1 or lineNo > #lines then
+		return source
+	end
+
+	local function isBlank(value)
+		return string.match(value, "^%s*$") ~= nil
+	end
+	local function isEndOnly(value)
+		return string.match(value, "^%s*end[%s;%)]*$") ~= nil
+	end
+
+	-- * Commenting out an `end` unbalances the chunk, so walk back to real code.
+	local target = lineNo
+	if isEndOnly(lines[target]) then
+		local prev = target - 1
+		while prev >= 1 and (isBlank(lines[prev]) or isEndOnly(lines[prev])) do
+			prev -= 1
+		end
+		if prev >= 1 then
+			target = prev
+		end
+	end
+
+	lines[target] = "--[decompiler] " .. lines[target]
+	return table.concat(lines, "\n")
+end
+
+-- * Only patterns that are provably safe: each one rewrites a token the Luau
+-- * lexer cannot accept, and none of them can change scope or evaluation order.
+local REPAIRS = {
+	{ name = "dangling method colon", pattern = ":([ \t]*)\r?\n([ \t]*)end", replace = "%1\n%2end" },
+	{ name = "dangling method colon (closer)", pattern = ":([ \t]*)\r?\n([ \t]*)([%)%]%},;])", replace = "%1\n%2%3" },
+	{ name = "dangling concat", pattern = "%.%.([ \t]*)\r?\n([ \t]*)end", replace = ".. nil%1\n%2end" },
+	{ name = "dangling assignment", pattern = "=%s*\r?\n([ \t]*)end", replace = "= nil\n%1end" },
+	{ name = "dangling assignment (eof)", pattern = "=([ \t]*)$", replace = "= nil%1" },
+	{ name = "trailing decimal point", pattern = "(%d)%.([^%d%.])", replace = "%1.0%2" },
+	{ name = "empty exponent", pattern = "(%d)[eE]([^%d%+%-])", replace = "%1e0%2" },
+	{ name = "empty hex literal", pattern = "0[xX]([^%da-fA-F])", replace = "0x0%1" },
+}
+
+local function repairSource(source)
+	local applied = {}
+	for _ = 1, 3 do
+		local changed = false
+		for _, rule in REPAIRS do
+			local out, count = string.gsub(source, rule.pattern, rule.replace)
+			if count > 0 and out ~= source then
+				source = out
+				changed = true
+				applied[#applied + 1] = rule.name .. " x" .. count
+			end
+		end
+		if not changed or not compileError(source) then
+			break
+		end
+	end
+	return source, applied
+end
+
+local function identifierPattern(name)
+	return "%f[%w_]" .. name .. "%f[^%w_]"
+end
+
+local function countOccurrences(source, name)
+	local count = 0
+	for _ in string.gmatch(source, identifierPattern(name)) do
+		count += 1
+	end
+	return count
+end
+
+-- * Cosmetic only. Every step is re-validated by the caller and rolled back on
+-- * failure, so a bad cleanup can never make a working script unusable.
+local function cleanSource(source)
+	if #source > CLEAN_MAX then
+		return source
+	end
+
+	source = string.gsub(source, "\r\n?", "\n")
+	source = string.gsub(source, "[ \t]+\n", "\n")
+	source = string.gsub(source, "\n\n\n+", "\n\n")
+	source = string.gsub(source, "\n[ \t]*;[ \t]*\n", "\n")
+	source = string.gsub(source, "\n[ \t]*do[ \t]+end[ \t]*\n", "\n")
+	source = string.gsub(source, "([ \t])end;", "%1end")
+
+	-- * Declaration-only locals: count == 1 means nothing else mentions them.
+	local dead = {}
+	for name in string.gmatch(source, "\n[ \t]*local%s+([%a_][%w_]*)%s*\n") do
+		if not dead[name] and countOccurrences(source, name) == 1 then
+			dead[name] = true
+			source = string.gsub(source, "\n[ \t]*local%s+" .. name .. "%s*\n", "\n")
+		end
+	end
+
+	-- * l__Foo__1 -> Foo, but only while `Foo` is still unused in the file.
+	for junk, base in string.gmatch(source, "local%s+(l__([%a_][%w_]*)__%d+)%s*=") do
+		if countOccurrences(source, base) == 0 then
+			source = string.gsub(source, identifierPattern(junk), base)
+		end
+	end
+
+	return string.gsub(source, "\n+$", "\n")
+end
+
+-- * Returns source, status, error, repairs
+local function processDecompiledSource(source, options)
+	local err = compileError(source)
+	local status = "valid"
+	local applied
+
+	if err and options.Repair then
+		local repaired, repairs = repairSource(source)
+		if #repairs > 0 then
+			applied = repairs
+			local stillBroken = compileError(repaired)
+			if not stillBroken then
+				source, err, status = repaired, nil, "repaired (" .. #repairs .. " pattern(s))"
+			else
+				source, err = repaired, stillBroken
+			end
+		end
+	end
+
+	if err then
+		local lineNo = tonumber(string.match(err, ":(%d+):"))
+		source = commentOutBrokenLine(source, lineNo)
+		status = "broken (line " .. tostring(lineNo or "?") .. " commented out)"
+		source = longComment(" DECOMPILER SYNTAX ERROR: " .. err .. "\n") .. "\n" .. source
+	elseif options.Clean then
+		local cleaned = cleanSource(source)
+		if cleaned ~= source and not compileError(cleaned) then
+			source = cleaned
+			if status == "valid" then
+				status = "cleaned"
+			end
+		end
+	end
+
+	return source, status, err, applied
+end
+
 local cachedPlaceName = USSI.PlaceName
 
 local FULL_VERSION
@@ -3670,6 +3924,8 @@ end
 --- @field DecompileIgnore {Instance | string} | {[Instance | string]: boolean | {[string]: boolean}} -- Skip decompiling matched [Instance]s and their children. `Source` becomes a short ignored message. You can pass an [Instance], a class name, or `ClassName = {Name1, Name2}`. Set an [Instance] to `false` to skip only that instance, not its children. ___Default:___ {TextChatService}
 --- @field SourceCache {[Instance]: string} | false -- Source text to use for these scripts as-is instead of decompiling them. ___Default:___ false
 --- @field DecompileJobless boolean -- Only use scripts that are already in the decompile cache. Missing scripts get a short not-found message. This turns on `scriptcache`. ___Default:___ false
+--- @field CleanDecompiledCode boolean -- Run the cosmetic cleanup pass on decompiled output (trailing whitespace, blank-line runs, dead local declarations, l__Name__1 junk names). A cleanup is only kept if the result still compiles. ___Default:___ true
+--- @field ServerScriptMap boolean -- Emit a SERVER_RECONSTRUCTION script listing the server-side layout inferred from client code (looked-up paths, remotes fired/listened to, modules required) with the referencing script and line. Server scripts themselves never replicate. ___Default:___ true
 --- @field scriptcache boolean -- If the executor supports `getscriptbytecode`, cache decompiled code. This avoids decompiling the same script twice. The cache stays after the script reloads. ___Default:___ true
 --- @field RecoverScriptsFromAssets boolean -- Recover the original `Source` of scripts that were published as assets. Changes made after publishing are not included. ___Default:___ true
 --- @field IsolatePlayers boolean -- Put every [Player] under a top-level `"Players"` Folder instead of inside the [Players] service. This turns on `SaveNotCreatable`. If both are on, this option is used instead of `IsolateLocalPlayer`. ___Default:___ false
@@ -3830,6 +4086,8 @@ local function synsaveinstance(...)
 		Decompile = true,
 		DecompileTimeout = 10,
 		DecompileJobless = false,
+		CleanDecompiledCode = true,
+		ServerScriptMap = true,
 		RecoverScriptsFromAssets = true,
 		-- decomptype = "",
 		scriptcache = true,
@@ -3930,6 +4188,8 @@ local function synsaveinstance(...)
 			Compression = "CompressionMode",
 			Debug = "__DEBUG_MODE",
 			DecompileScripts = "Decompile",
+			CleanCode = "CleanDecompiledCode",
+			ServerMap = "ServerScriptMap",
 			Decompiler = "Decompile",
 			DecompilerTimeout = "DecompileTimeout",
 			EmbedBytecode = "SaveBytecode",
@@ -4333,7 +4593,33 @@ local function synsaveinstance(...)
 	end
 
 	local function sanitizeFileName(str)
-		return string.sub(string.gsub(string.gsub(string.gsub(str, "[^%w _]", ""), " +", " "), " +$", ""), 1, 240)
+		local cleaned = string.gsub(tostring(str), "%c", " ")
+		cleaned = string.gsub(cleaned, '[<>:"/\\|?*]', "_")
+		cleaned = string.gsub(cleaned, "%s+", " ")
+		cleaned = string.gsub(cleaned, "^[%s%.]+", "")
+		cleaned = string.gsub(cleaned, "[%s%.]+$", "")
+		if cleaned == "" then
+			cleaned = "dump"
+		end
+		if #cleaned > 120 then
+			local hash = 0
+			for i = 1, #cleaned do
+				hash = (hash * 31 + string.byte(cleaned, i)) % 0xFFFFFFFF
+			end
+			cleaned = string.sub(cleaned, 1, 100) .. "-" .. string.format("%08x", hash)
+		end
+		return cleaned
+	end
+
+	local function timestamp()
+		local ok, value = pcall(function()
+			return DateTime.now():FormatUniversalTime("YYYYMMDD-HHmmss", "en-gb")
+		end)
+		if ok and value then
+			return value
+		end
+		local osOk, osValue = pcall(os.date, "%Y%m%d-%H%M%S")
+		return osOk and osValue or "00000000-000000"
 	end
 
 	local EXEC_STATE_FILE = USSI_FOLDER .. "EXEC_STATE.json"
@@ -4461,33 +4747,37 @@ local function synsaveinstance(...)
 			if not cachedPlaceName then
 				local ok, info =
 					pcall(service.MarketplaceService.GetProductInfoAsync, service.MarketplaceService, game.PlaceId)
-				if ok then
+				if ok and type(info) == "table" then
 					cachedPlaceName = info.Name
 					USSI.PlaceName = cachedPlaceName
 				end
 			end
 
-			local PlaceName = cachedPlaceName and (game.PlaceId .. " " .. cachedPlaceName) or game.PlaceId
+			local placeId = tostring(game.PlaceId)
+			local placeName = sanitizeFileName(cachedPlaceName or "unknown")
+
+			local baseName
 			if IsModel then
-				placename = sanitizeFileName("model " .. PlaceName .. " " .. (Object or tmp[1] or game):GetFullName())
+				local target = Object or tmp[1]
+				local targetPath = target and target:GetFullName() or "model"
+				baseName = sanitizeFileName("model " .. placeId .. " " .. placeName .. " " .. targetPath)
 			else
-				placename = sanitizeFileName("place " .. PlaceName)
-			end
-		end
-
-		if FilePath then
-		elseif OPTIONS.AvoidFileOverwrite and isfile then
-			local counter = 0
-			local temp = placename
-
-			while isfile(temp .. filetype) do
-				counter += 1
-				temp = placename .. "(" .. counter .. ")"
+				baseName = sanitizeFileName("place " .. placeId .. " " .. placeName)
 			end
 
-			placename = temp .. filetype
-		else
-			placename = placename .. filetype
+			baseName ..= " " .. timestamp()
+
+			if OPTIONS.AvoidFileOverwrite and isfile then
+				local counter = 0
+				local candidate = baseName
+				while isfile(candidate .. filetype) do
+					counter += 1
+					candidate = baseName .. " (" .. counter .. ")"
+				end
+				baseName = candidate
+			end
+
+			placename = baseName .. filetype
 		end
 
 		local savedFiles = USSI.SavedFiles
@@ -4608,22 +4898,14 @@ local function synsaveinstance(...)
 	local function get_size_format()
 		local Size
 
-		for i, unit in
-			{
-				"B",
-				"KB",
-				"MB",
-				"GB",
-				"TB",
-			}
-		do
+		for i, unit in { "B", "KB", "MB", "GB", "TB" } do
 			if totalsize < 0x400 ^ i then
 				Size = math.floor(totalsize / (0x400 ^ (i - 1)) * 10) / 10 .. " " .. unit
 				break
 			end
 		end
 
-		return Size
+		return Size or string.format("%.1f PB", totalsize / 0x400 ^ 5)
 	end
 
 	local lastYield = os.clock()
@@ -4706,10 +4988,16 @@ local function synsaveinstance(...)
 
 		local function spawnWorker()
 			return task.spawn(function()
+				local idleSince = os.clock()
 				while true do
 					while not pendingJob do
-						task.wait()
+						if os.clock() - idleSince > 5 then
+							worker = nil -- * retire; the next call spawns a fresh worker
+							return
+						end
+						task.wait(0.25)
 					end
+					idleSince = os.clock()
 
 					local job = pendingJob
 					pendingJob = nil
@@ -4786,26 +5074,43 @@ local function synsaveinstance(...)
 		end
 	end
 
+	local processOptions = {
+		Repair = true,
+		Clean = OPTIONS.CleanDecompiledCode,
+	}
+
+	local function cacheEntry(output, status, err)
+		return { src = output, status = status, err = err }
+	end
+
+	local function readCache(bytecode)
+		local cached = ldeccache[bytecode]
+		if type(cached) == "string" then
+			return cacheEntry(cached, "valid") -- * older cache format
+		end
+		return cached
+	end
+
 	if not OPTIONS.Decompile then
 		ldecompile = function()
-			return "-- Decompiling is disabled"
+			return "-- Decompiling is disabled", "disabled"
 		end
 	elseif decompile then
 		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
 
 		ldecompile = function(script)
-			-- local name = scr.ClassName .. scr.Name
 			local bytecode
-			if ScriptCache then
-				local s
-				s, bytecode = getbytecode(script)
-				local cached
+			local cached
 
-				if s then
+			if ScriptCache then
+				local bytecodeOk
+				bytecodeOk, bytecode = getbytecode(script)
+
+				if bytecodeOk then
 					if not bytecode or bytecode == "" then
-						return "-- The Script is Empty"
+						return "-- The Script is Empty", "empty"
 					end
-					cached = ldeccache[bytecode]
+					cached = readCache(bytecode)
 				else
 					bytecode = nil
 				end
@@ -4814,43 +5119,45 @@ local function synsaveinstance(...)
 					if __DEBUG_MODE then
 						__DEBUG_MODE("Found in Cache", script:GetFullName())
 					end
-					return cached
+					return cached.src, cached.status, cached.err
 				elseif DecompileJobless then
-					return "-- Not found in already decompiled ScriptCache"
+					return "-- Not found in already decompiled ScriptCache", "missing"
 				end
-			else
-				if DecompileJobless then
-					return "-- Not found in already decompiled ScriptCache"
-				end
-
-				-- task.wait() -- TODO Maybe remove?
+			elseif DecompileJobless then
+				return "-- Not found in already decompiled ScriptCache", "missing"
 			end
 
 			local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
-			if not result then
-				ok, result = false, "Empty Output"
+			if not result or result == "" then
+				ok, result = false, (result == "" and "Empty Output" or "No Output")
 			end
 
-			local output
+			local output, status, err
 			if ok then
-				result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-				output = result
+				result = escapeNuls(result)
+				local repairs
+				output, status, err, repairs = processDecompiledSource(result, processOptions)
+				if repairs and #repairs > 0 and __DEBUG_MODE then
+					__DEBUG_MODE("Repaired", script:GetFullName(), table.concat(repairs, ", "))
+				end
 			else
-				output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
+				status = "failed"
+				err = tostring(result or "")
+				output = longComment(" Failed to decompile. Reason:\n" .. err .. "\n")
 			end
 
-			if ScriptCache and bytecode then -- TODO there might(?) be an edgecase where it manages to decompile (built-in) even though getscriptbytecode failed, and the output won't get cached
-				ldeccache[bytecode] = output -- ? Should we cache even if it timed out?
+			if ScriptCache and bytecode then
+				ldeccache[bytecode] = cacheEntry(output, status, err)
 				if __DEBUG_MODE then
 					__DEBUG_MODE("Cached", script:GetFullName())
 				end
 			end
 
-			return output
+			return output, status, err
 		end
 	else
 		ldecompile = function()
-			return "-- Your Executor does NOT have a Decompiler"
+			return "-- Your Executor does NOT have a Decompiler", "nodecompiler"
 		end
 	end
 
@@ -4917,85 +5224,120 @@ local function synsaveinstance(...)
 			return source, assetId
 		end
 	end
+	local ServerMap = OPTIONS.ServerScriptMap and { sources = {} } or nil
+
 	local function sourceFor(instance, ldIgnoring)
-		if ldIgnoring then
-			return "-- Ignored"
-		end
-		local userSource = SourceCache and SourceCache[instance] -- * SourceCache option: user-supplied source wins over decompiling
-		if userSource then
-			return userSource
-		end
-		local value
 		local linkedKey
+		local linkedSourceRaw = ""
+		local hasLinkedSource = false
 		local recoveredAssetId
 		local recoveredSource
-		local linkedOk, linkedSourceRaw = pcall(index, instance, "LinkedSource") -- ! AuroraScript has Source but not LinkedSource
-		if not linkedOk then
-			linkedSourceRaw = ""
-		end
-		local hasLinkedSource = linkedSourceRaw ~= ""
-		if hasLinkedSource then
-			linkedKey = string.match(linkedSourceRaw, "%w+$") -- TODO: No sure if this pattern matches all possible cases. Example is: 'rbxassetid://0&hash=cd73dd2fe5e5013137231c227da3167e'
-			if not linkedKey then -- * We print this anyway because very important
-				warn("FAILED TO EXTRACT LINKEDSOURCE (OPEN A GITHUB ISSUE): ", instance:GetFullName(), linkedSourceRaw)
+
+		if not ldIgnoring then
+			local linkedOk, linkedRaw = pcall(index, instance, "LinkedSource")
+			if linkedOk and type(linkedRaw) == "string" then
+				linkedSourceRaw = linkedRaw
+				hasLinkedSource = linkedRaw ~= ""
 			end
-		end
-		local chain = { instance }
-		local walk = RecoverScriptsFromAssets and instance
-		while walk do
-			local sourceAssetId = sourceAssetIdFor(walk)
-			if sourceAssetId then
-				recoveredSource, recoveredAssetId = sourceFromAsset(sourceAssetId, chain)
-				if recoveredSource then
-					break
+			if hasLinkedSource then
+				linkedKey = string.match(linkedSourceRaw, "%w+$")
+				if not linkedKey then
+					warn("FAILED TO EXTRACT LINKEDSOURCE (OPEN A GITHUB ISSUE): ", instance:GetFullName(), linkedSourceRaw)
 				end
 			end
 
-			local parent = walk.Parent
-			if not parent then
-				break
+			if RecoverScriptsFromAssets then
+				local chain = { instance }
+				local walk = instance
+				while walk do
+					local sourceAssetId = sourceAssetIdFor(walk)
+					if sourceAssetId then
+						recoveredSource, recoveredAssetId = sourceFromAsset(sourceAssetId, chain)
+						if recoveredSource then
+							break
+						end
+					end
+
+					local parent = walk.Parent
+					if not parent then
+						break
+					end
+					chain[#chain + 1] = parent
+					walk = parent
+				end
+				if recoveredAssetId and RecoveredScripts then
+					table.insert(RecoveredScripts, instance:GetFullName())
+				end
 			end
-			chain[#chain + 1] = parent
-			walk = parent
-		end
-		if recoveredAssetId and RecoveredScripts then
-			table.insert(RecoveredScripts, instance:GetFullName())
 		end
 
 		local isLocalScript = instance:IsA("LocalScript")
-		if
-			isLocalScript and instance.RunContext == Enum.RunContext.Server
-			or not isLocalScript and instance:IsA("Script") and instance.RunContext ~= Enum.RunContext.Client
-		then
-			if recoveredSource then
-				value = recoveredSource
-				recoveredSource = nil -- Emitted as the executable source instead of a comment block
-			else
-				value = "-- [FilteringEnabled] Server Scripts are IMPOSSIBLE to save" -- TODO: Could be not just server scripts in the future
-			end
+		local runContextOk, runContext = pcall(index, instance, "RunContext")
+		if not runContextOk then
+			runContext = nil
+		end
+		local isServerScript = (isLocalScript and runContext == Enum.RunContext.Server)
+			or (not isLocalScript and instance:IsA("Script") and runContext ~= Enum.RunContext.Client)
+
+		local value, status, err, note
+
+		if ldIgnoring then
+			value, status = "-- Ignored (DecompileIgnore)", "ignored"
 		else
-			value = ldecompile(instance)
-			if SaveBytecode then
-				local output = SaveBytecode(instance)
-				if output then
-					value = output .. value
+			local userSource = SourceCache and SourceCache[instance]
+			if userSource then
+				value, status = userSource, "user-provided"
+			end
+		end
+
+		if not value then
+			if isServerScript then
+				if recoveredSource then
+					value, status = recoveredSource, "server (recovered source)"
+					note = "Recovered from SourceAssetId " .. tostring(recoveredAssetId)
+					recoveredSource = nil
+				else
+					value = "-- [FilteringEnabled] Server Scripts are IMPOSSIBLE to save client-side."
+						.. "\n-- See the SERVER_RECONSTRUCTION report in this dump for an inferred server layout."
+					status = "server (not replicated)"
+				end
+			else
+				value, status, err = ldecompile(instance)
+				if SaveBytecode then
+					local bytecodeBlock = SaveBytecode(instance)
+					if bytecodeBlock then
+						value = bytecodeBlock .. value
+					end
+				end
+				if recoveredSource then
+					note = "Original source recovered from SourceAssetId " .. tostring(recoveredAssetId)
 				end
 			end
 		end
 
 		local assetSourceBlock = ""
 		if recoveredSource then
-			local level = 0
-			for eqs in string.gmatch(recoveredSource, "%](=*)%]") do
-				if #eqs >= level then
-					level = #eqs + 1
-				end
-			end
-			local eq = string.rep("=", level)
-			assetSourceBlock = "--[" .. eq .. "[\n" .. recoveredSource .. "\n]" .. eq .. "]\n\n"
+			assetSourceBlock = longComment(recoveredSource) .. "\n\n"
 		end
 
-		value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
+		local headerLines = {
+			"-- UniversalSynSaveInstance dump",
+			"-- Path: " .. instance:GetFullName(),
+			"-- Class: " .. instance.ClassName,
+			"-- Status: " .. (status or "unknown"),
+		}
+		if note then
+			headerLines[#headerLines + 1] = "-- " .. note
+		end
+		if err then
+			headerLines[#headerLines + 1] = "-- Error: " .. string.gsub(tostring(err), "[\r\n]+", " ")
+		end
+		headerLines[#headerLines + 1] = ""
+		headerLines[#headerLines + 1] = ""
+
+		local header = table.concat(headerLines, "\n")
+
+		value = header
 			.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (linkedKey and string.find(
 				linkedKey,
 				"%a"
@@ -5005,7 +5347,197 @@ local function synsaveinstance(...)
 			.. assetSourceBlock
 			.. value
 
+		if ServerMap then
+			ServerMap.sources[instance] = value
+		end
+
 		return value
+	end
+
+	local SERVER_MAP_MAX = 4000
+
+	local function buildServerMapReport(ctx)
+		if not ServerMap then
+			return "-- Server reconstruction map is disabled (ServerScriptMap = false).\n"
+		end
+
+		local sources = ServerMap.sources
+		local nodes, order = {}, {}
+
+		local function normalizeTarget(raw, kind)
+			raw = string.gsub(raw, "%s+", "")
+			if raw == "" then
+				return nil
+			end
+			if kind == "require" or kind == "service" then
+				return "game." .. raw
+			end
+			if string.sub(raw, 1, 5) == "game." then
+				return raw
+			end
+			local tail = string.match(raw, "([%w_]+)$")
+			if not tail or tail == "game" then
+				return nil
+			end
+			return tail
+		end
+
+		local function nodeFor(path)
+			local node = nodes[path]
+			if not node then
+				if #order >= SERVER_MAP_MAX then
+					return nil
+				end
+				node = { refs = {} }
+				nodes[path] = node
+				order[#order + 1] = path
+			end
+			return node
+		end
+
+		local function addRef(path, kind, scriptPath, lineNo, snippet)
+			local node = nodeFor(path)
+			if not node or #node.refs >= 20 then
+				return
+			end
+			node.refs[#node.refs + 1] = {
+				kind = kind,
+				script = scriptPath,
+				line = lineNo,
+				snippet = snippet,
+			}
+		end
+
+		local SCAN = {
+			{ kind = "service", pattern = 'GetService%(%s*["\']([%w_]+)["\']' },
+			{ kind = "WaitForChild", pattern = '([%w_%.]+):WaitForChild%s*%(%s*["\']([^"\'\r\n]+)["\']', child = true },
+			{ kind = "FindFirstChild", pattern = '([%w_%.]+):FindFirstChild%s*%(%s*["\']([^"\'\r\n]+)["\']', child = true },
+			{ kind = "FindFirstChildOfClass", pattern = 'FindFirstChildOfClass%s*%(%s*["\']([%w_]+)["\']' },
+			{ kind = "require", pattern = "require%s*%(%s*game%.([%w_%.]+)" },
+			{ kind = "FireServer", pattern = "([%w_%.%[%]\"'_:]+):FireServer%s*%(" },
+			{ kind = "InvokeServer", pattern = "([%w_%.%[%]\"'_:]+):InvokeServer%s*%(" },
+			{ kind = "OnClientEvent", pattern = "([%w_%.%[%]\"'_:]+):OnClientEvent" },
+			{ kind = "OnServerEvent", pattern = "([%w_%.%[%]\"'_:]+):OnServerEvent" },
+			{ kind = "FireAllClients", pattern = "([%w_%.%[%]\"'_:]+):FireAllClients" },
+			{ kind = "Bindable", pattern = "Instance%.new%s*%(%s*[\"']Bindable[%w]*[\"']" },
+		}
+
+		local scanned = 0
+
+		for _, instance in ctx.ordered do
+			if not instance:IsA("LuaSourceContainer") then
+				continue
+			end
+
+			local source = sources[instance]
+			if not source then
+				local ok, value = pcall(sourceFor, instance, decompileIgnoreMap[instance])
+				if ok and type(value) == "string" then
+					source = value
+					sources[instance] = value
+				end
+			end
+			if not source then
+				continue
+			end
+
+			scanned += 1
+			local scriptPath = instance:GetFullName()
+			local lineNo = 0
+
+			for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+				lineNo += 1
+				if #line > 0 and #line <= 400 then
+					for _, rule in SCAN do
+						local first, second = string.match(line, rule.pattern)
+						if first then
+							local target
+							if rule.child then
+								target = normalizeTarget(first .. "." .. second, "path")
+							else
+								target = normalizeTarget(first, rule.kind)
+							end
+							if target then
+								addRef(target, rule.kind, scriptPath, lineNo, string.sub(line, 1, 160))
+							end
+						end
+					end
+				end
+			end
+		end
+
+		table.sort(order)
+
+		local groups, groupOrder = {}, {}
+		for _, path in order do
+			local head = string.match(path, "^(game%.[%w_]+)") or "unresolved names"
+			local group = groups[head]
+			if not group then
+				group = {}
+				groups[head] = group
+				groupOrder[#groupOrder + 1] = head
+			end
+			group[#group + 1] = path
+		end
+		table.sort(groupOrder)
+
+		local out, n = {}, 0
+		local function w(line)
+			n += 1
+			out[n] = "-- " .. line
+		end
+
+		w("SERVER RECONSTRUCTION REPORT")
+		w("")
+		w("Server scripts do not replicate to the client, so their contents cannot be dumped.")
+		w("This report lists what the client code proves exists on the server: paths it")
+		w("looks up, remotes it fires or listens to, modules it requires, and the client")
+		w("script plus line number that does it. Every entry is inferred, not confirmed.")
+		w("")
+		w(string.format("Scanned %d script(s); %d referenced path(s).", scanned, #order))
+		w("")
+
+		local visibleServer = {}
+		for _, instance in ctx.ordered do
+			if instance:IsA("Script") and not instance:IsA("LocalScript") then
+				local ok, runContext = pcall(index, instance, "RunContext")
+				if ok and runContext == Enum.RunContext.Server then
+					visibleServer[#visibleServer + 1] = instance
+				end
+			end
+		end
+
+		w("VISIBLE SERVER SCRIPTS (source unavailable)")
+		if #visibleServer == 0 then
+			w("  none")
+		else
+			table.sort(visibleServer, function(a, b)
+				return a:GetFullName() < b:GetFullName()
+			end)
+			for _, instance in visibleServer do
+				w("  " .. instance:GetFullName() .. "  [" .. instance.ClassName .. "]")
+			end
+		end
+		w("")
+
+		if #order == 0 then
+			w("No server-side references were found in the saved client scripts.")
+			w("")
+		else
+			for _, head in groupOrder do
+				w(head)
+				for _, path in groups[head] do
+					w("- " .. path)
+					for _, ref in nodes[path].refs do
+						w("    " .. ref.kind .. " <- " .. ref.script .. ":" .. ref.line)
+						w("      " .. string.gsub(ref.snippet, "%s+$", ""))
+					end
+				end
+				w("")
+			end
+		end
+
+		return table.concat(out, "\n")
 	end
 
 	local function replaceClassName(instance, InstanceName, ClassName)
@@ -5319,7 +5851,11 @@ local function synsaveinstance(...)
 		attributeRefsInline = OPTIONS.Binary
 
 		attributeRefOfHandle = function(handle)
-			return refs[handle:Get()]
+			local ok, value = pcall(handle.Get, handle)
+			if not ok then
+				return nil
+			end
+			return refs[value]
 		end
 
 		local deferred = {}
@@ -5530,8 +6066,8 @@ local function synsaveinstance(...)
 
 			for i = 1, n do
 				yieldIfDue()
-				local raw = readProperty(objs[i], prop)
-				if raw == __BREAK then
+				local readOk, raw = pcall(readProperty, objs[i], prop)
+				if not readOk or raw == __BREAK then
 					return nil, i
 				end
 				vals[i] = raw
@@ -5926,10 +6462,11 @@ local function synsaveinstance(...)
 						local Category, Optional = Property.Category, Property.Optional
 						local raw
 
-						raw = readProperty(instance, Property)
-						if raw == __BREAK then
+						local readOk, readValue = pcall(readProperty, instance, Property)
+						if not readOk or readValue == __BREAK then
 							continue
 						end
+						raw = readValue
 
 						if
 							default_instance
@@ -6305,6 +6842,14 @@ local function synsaveinstance(...)
 			end)
 		end
 
+		local mapCtx
+		local mapExtra
+		if ServerMap then
+			mapExtra = register_extra("SERVER_RECONSTRUCTION", nil, nil, "Script", function()
+				return mapCtx and buildServerMapReport(mapCtx) or "-- Server map unavailable."
+			end)
+		end
+
 		-- One collect over the main roots plus every extra's roots.
 		local allRoots = table.clone(ToSaveList)
 		for _, extra in pendingExtras do
@@ -6314,6 +6859,7 @@ local function synsaveinstance(...)
 		end
 
 		local ctx = collect(allRoots)
+		mapCtx = ctx
 
 		-- collect filtered and deduped; recover each extra's surviving roots.
 		for _, extra in pendingExtras do
@@ -6331,6 +6877,13 @@ local function synsaveinstance(...)
 			local readmeEntry = ctx.entries[readmeExtra.roots[1]]
 			if readmeEntry then
 				readmeEntry.deferLast = true -- emitBinary encodes this bucket after all others
+			end
+		end
+
+		if mapExtra then
+			local mapEntry = ctx.entries[mapExtra.roots[1]]
+			if mapEntry then
+				mapEntry.deferLast = true -- must run after every script's Source is known
 			end
 		end
 
@@ -7166,6 +7719,10 @@ local function synsaveinstance(...)
 				task.wait(Log10 + ExtraTime)
 			end
 			StatusText:Destroy()
+			if USSI.StatusGui then
+				USSI.StatusGui:Destroy()
+				USSI.StatusGui = nil
+			end
 		end)
 	end
 
