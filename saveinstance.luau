@@ -300,6 +300,8 @@ end
 -- * Only patterns that are provably safe: each one rewrites a token the Luau
 -- * lexer cannot accept, and none of them can change scope or evaluation order.
 local REPAIRS = {
+	{ name = "embedded decompiler error line", pattern = "\n:(%d+): ([^\n]*)", replace = "\n-- decompiler said %1: %2" },
+	{ name = "dangling method colon (blank lines)", pattern = ":([ \t\r\n]*)(end)", replace = "%1%2" },
 	{ name = "dangling method colon", pattern = ":([ \t]*)\r?\n([ \t]*)end", replace = "%1\n%2end" },
 	{ name = "dangling method colon (closer)", pattern = ":([ \t]*)\r?\n([ \t]*)([%)%]%},;])", replace = "%1\n%2%3" },
 	{ name = "dangling concat", pattern = "%.%.([ \t]*)\r?\n([ \t]*)end", replace = ".. nil%1\n%2end" },
@@ -5417,79 +5419,123 @@ local function synsaveinstance(...)
 		return value
 	end
 
-	local SERVER_MAP_MAX = 4000
+	local SERVER_MAP_MAX = 600
 
-	local function buildServerMapReport(ctx)
-		if not ServerMap then
-			return "-- Server reconstruction map is disabled (ServerScriptMap = false).\n"
-		end
-
+	local function buildServerMapTree(rootNode, ctx)
 		local sources = ServerMap.sources
-		local nodes, order = {}, {}
+		local rootOverride = InstancesOverrides[rootNode]
+		local topChildren = rootOverride.__Children
 
-		local function normalizeTarget(raw, kind)
-			raw = string.gsub(raw, "%s+", "")
-			if raw == "" then
-				return nil
-			end
-			if kind == "require" or kind == "service" then
-				return "game." .. raw
-			end
-			if string.sub(raw, 1, 5) == "game." then
-				return raw
-			end
-			local tail = string.match(raw, "([%w_]+)$")
-			if not tail or tail == "game" then
-				return nil
-			end
-			return tail
+		local folders = {}
+		local leaves = 0
+		local refLines = {}
+		local unresolved = 0
+
+		local function sanitize(name)
+			name = string.gsub(name, "[^%w_ ]", "_")
+			name = string.gsub(name, "%s+", " ")
+			return string.sub(name, 1, 60)
 		end
 
-		local function nodeFor(path)
-			local node = nodes[path]
-			if not node then
-				if #order >= SERVER_MAP_MAX then
-					return nil
-				end
-				node = { refs = {} }
-				nodes[path] = node
-				order[#order + 1] = path
+		local function folder(parentChildren, key, name)
+			local existing = folders[key]
+			if existing then
+				return existing
 			end
+			local node = {}
+			InstancesOverrides[node] = {
+				__ClassName = "Folder",
+				__Virtual = "Folder",
+				__Children = {},
+				Properties = { Name = sanitize(name) },
+			}
+			folders[key] = node
+			parentChildren[#parentChildren + 1] = node
 			return node
 		end
 
-		local function addRef(path, kind, scriptPath, lineNo, snippet)
-			local node = nodeFor(path)
-			if not node or #node.refs >= 20 then
-				return
-			end
-			node.refs[#node.refs + 1] = {
-				kind = kind,
-				script = scriptPath,
-				line = lineNo,
-				snippet = snippet,
+		local function attach(node, parent)
+			local override = InstancesOverrides[node]
+			local class = override.__ClassName
+			local entry = {
+				tag = class,
+				class = class,
+				propClass = class,
+				override = override,
+				propsOnly = true,
+				virtual = true,
+				parent = parent,
 			}
+			ctx.entries[node] = entry
+			ctx.refs[node] = ctx.instCount
+			ctx.instCount += 1
+			local bucket = class .. "\0" .. class .. "\0propsOnly"
+			local list = ctx.classList[bucket]
+			if not list then
+				list = {}
+				ctx.classList[bucket] = list
+				ctx.instTypeCount += 1
+			end
+			list[#list + 1] = node
+			ctx.ordered[#ctx.ordered + 1] = node
+			local kids = {}
+			entry.children = kids
+			for _, child in override.__Children do
+				kids[#kids + 1] = child
+				attach(child, node)
+			end
 		end
 
-		local SCAN = {
-			{ kind = "service", pattern = 'GetService%(%s*["\']([%w_]+)["\']' },
-			{ kind = "WaitForChild", pattern = '([%w_%.]+):WaitForChild%s*%(%s*["\']([^"\'\r\n]+)["\']', child = true },
-			{ kind = "FindFirstChild", pattern = '([%w_%.]+):FindFirstChild%s*%(%s*["\']([^"\'\r\n]+)["\']', child = true },
-			{ kind = "FindFirstChildOfClass", pattern = 'FindFirstChildOfClass%s*%(%s*["\']([%w_]+)["\']' },
-			{ kind = "require", pattern = "require%s*%(%s*game%.([%w_%.]+)" },
-			{ kind = "FireServer", pattern = "([%w_%.%[%]\"'_:]+):FireServer%s*%(" },
-			{ kind = "InvokeServer", pattern = "([%w_%.%[%]\"'_:]+):InvokeServer%s*%(" },
-			{ kind = "OnClientEvent", pattern = "([%w_%.%[%]\"'_:]+):OnClientEvent" },
-			{ kind = "OnServerEvent", pattern = "([%w_%.%[%]\"'_:]+):OnServerEvent" },
-			{ kind = "FireAllClients", pattern = "([%w_%.%[%]\"'_:]+):FireAllClients" },
-			{ kind = "Bindable", pattern = "Instance%.new%s*%(%s*[\"']Bindable[%w]*[\"']" },
-		}
+		local function resolveLeaf(path)
+			local segments = {}
+			for segment in string.gmatch(path, "[^%.]+") do
+				if segment ~= "game" then
+					segments[#segments + 1] = segment
+				end
+			end
+			if #segments == 0 then
+				return nil
+			end
+
+			local service = segments[1]
+			local known = service == "ServerScriptService"
+				or service == "ServerStorage"
+				or service == "ReplicatedStorage"
+				or service == "Workspace"
+				or service == "ReplicatedFirst"
+			local topName = known and service or "Unresolved"
+			if not known then
+				unresolved += 1
+			end
+
+			local parent = folder(topChildren, "top:" .. topName, topName)
+			for i = 2, #segments - 1 do
+				local key = "d:" .. table.concat(segments, ".", 1, i)
+				parent = folder(InstancesOverrides[parent].__Children, key, segments[i])
+			end
+
+			local leafName = segments[#segments]
+			local leaf = {}
+			InstancesOverrides[leaf] = {
+				__ClassName = "Script",
+				__Virtual = "Script",
+				__Children = {},
+				Properties = { Name = sanitize(leafName), Source = "" },
+			}
+			InstancesOverrides[leaf].__Path = path
+			InstancesOverrides[parent].__Children[#InstancesOverrides[parent].__Children + 1] = leaf
+			leaves += 1
+			return leaf
+		end
 
 		local scanned = 0
 
 		for _, instance in ctx.ordered do
 			if typeof(instance) ~= "Instance" or not instance:IsA("LuaSourceContainer") then
 				continue
+			end
+			if leaves >= SERVER_MAP_MAX then
+				break
 			end
 
 			local source = sources[instance]
@@ -5500,7 +5546,7 @@ local function synsaveinstance(...)
 					sources[instance] = value
 				end
 			end
-			if not source then
+			if not source or #source > 250 * 1024 then
 				continue
 			end
 
@@ -5521,8 +5567,21 @@ local function synsaveinstance(...)
 								else
 									target = normalizeTarget(first, rule.kind)
 								end
-								if target then
-									addRef(target, rule.kind, scriptPath, lineNo, string.sub(line, 1, 160))
+								if target and leaves < SERVER_MAP_MAX then
+									local leaf = resolveLeaf(target)
+									if leaf then
+										refLines[leaf] = refLines[leaf] or {}
+										local refs = refLines[leaf]
+										if #refs < 20 then
+											refs[#refs + 1] = string.format(
+												"-- %s <- %s:%d\n--   %s",
+												rule.kind,
+												scriptPath,
+												lineNo,
+												string.gsub(string.sub(line, 1, 160), "%s+$", "")
+											)
+										end
+									end
 								end
 							end
 						end
@@ -5534,78 +5593,61 @@ local function synsaveinstance(...)
 			end
 		end
 
-		table.sort(order)
-
-		local groups, groupOrder = {}, {}
-		for _, path in order do
-			local head = string.match(path, "^(game%.[%w_]+)") or "unresolved names"
-			local group = groups[head]
-			if not group then
-				group = {}
-				groups[head] = group
-				groupOrder[#groupOrder + 1] = head
-			end
-			group[#group + 1] = path
-		end
-		table.sort(groupOrder)
-
-		local out, n = {}, 0
-		local function w(line)
-			n += 1
-			out[n] = "-- " .. line
+		for node, refs in refLines do
+			local override = InstancesOverrides[node]
+			override.Properties.Source = table.concat({
+				"-- INFERRED server-side file. Source unavailable client-side.",
+				"-- Target: " .. override.__Path,
+				"-- Referenced by:",
+				table.concat(refs, "\n"),
+				"",
+			}, "\n")
 		end
 
-		w("SERVER RECONSTRUCTION REPORT")
-		w("")
-		w("Server scripts do not replicate to the client, so their contents cannot be dumped.")
-		w("This report lists what the client code proves exists on the server: paths it")
-		w("looks up, remotes it fires or listens to, modules it requires, and the client")
-		w("script plus line number that does it. Every entry is inferred, not confirmed.")
-		w("")
-		w(string.format("Scanned %d script(s); %d referenced path(s).", scanned, #order))
-		w("")
+		local summary = {}
+		summary[#summary + 1] = "-- SERVER RECONSTRUCTION SUMMARY"
+		summary[#summary + 1] = "--"
+		summary[#summary + 1] = "-- Server scripts do not replicate, so this tree is inferred from client code."
+		summary[#summary + 1] = "-- Each Script below sits where the target roughly belongs and lists what calls it."
+		summary[#summary + 1] = "--"
+		summary[#summary + 1] = string.format("-- Scanned %d script(s), built %d file(s), %d unresolved.", scanned, leaves, unresolved)
 
-		local visibleServer = {}
+		local visible = {}
 		for _, instance in ctx.ordered do
 			if typeof(instance) == "Instance" and instance:IsA("Script") and not instance:IsA("LocalScript") then
 				local ok, runContext = pcall(index, instance, "RunContext")
 				if ok and runContext == Enum.RunContext.Server then
-					visibleServer[#visibleServer + 1] = instance
+					visible[#visible + 1] = instance
 				end
 			end
 		end
+		table.sort(visible, function(a, b)
+			return a:GetFullName() < b:GetFullName()
+		end)
 
-		w("VISIBLE SERVER SCRIPTS (source unavailable)")
-		if #visibleServer == 0 then
-			w("  none")
+		summary[#summary + 1] = ""
+		summary[#summary + 1] = "-- VISIBLE SERVER SCRIPTS (source unavailable)"
+		if #visible == 0 then
+			summary[#summary + 1] = "--   none"
 		else
-			table.sort(visibleServer, function(a, b)
-				return a:GetFullName() < b:GetFullName()
-			end)
-			for _, instance in visibleServer do
-				w("  " .. instance:GetFullName() .. "  [" .. instance.ClassName .. "]")
+			for _, instance in visible do
+				summary[#summary + 1] = "--   " .. instance:GetFullName() .. "  [" .. instance.ClassName .. "]"
 			end
 		end
-		w("")
+		summary[#summary + 1] = ""
 
-		if #order == 0 then
-			w("No server-side references were found in the saved client scripts.")
-			w("")
-		else
-			for _, head in groupOrder do
-				w(head)
-				for _, path in groups[head] do
-					w("- " .. path)
-					for _, ref in nodes[path].refs do
-						w("    " .. ref.kind .. " <- " .. ref.script .. ":" .. ref.line)
-						w("      " .. string.gsub(ref.snippet, "%s+$", ""))
-					end
-				end
-				w("")
-			end
+		local summaryNode = {}
+		InstancesOverrides[summaryNode] = {
+			__ClassName = "Script",
+			__Virtual = "Script",
+			__Children = {},
+			Properties = { Name = "_SUMMARY", Source = table.concat(summary, "\n") },
+		}
+		topChildren[#topChildren + 1] = summaryNode
+
+		for _, child in rootOverride.__Children do
+			attach(child, rootNode)
 		end
-
-		return table.concat(out, "\n")
 	end
 
 	local function replaceClassName(instance, InstanceName, ClassName)
@@ -6921,17 +6963,7 @@ local function synsaveinstance(...)
 		local mapCtx
 		local mapExtra
 		if ServerMap then
-			mapExtra = register_extra("SERVER_RECONSTRUCTION", nil, nil, "Script", function()
-				if not mapCtx then
-					return "-- Server map unavailable."
-				end
-				local mapOk, mapReport = pcall(buildServerMapReport, mapCtx)
-				if mapOk and type(mapReport) == "string" then
-					return mapReport
-				end
-				recordPipelineError("SERVER_RECONSTRUCTION", mapReport)
-				return "-- Server map failed: " .. tostring(mapReport)
-			end)
+			mapExtra = register_extra("Server Reconstruction", nil, nil, "Folder")
 		end
 
 		-- One collect over the main roots plus every extra's roots.
@@ -6944,6 +6976,13 @@ local function synsaveinstance(...)
 
 		local ctx = collect(allRoots)
 		mapCtx = ctx
+
+		if mapExtra then
+			local mapOk, mapErr = pcall(buildServerMapTree, mapExtra.roots[1], ctx)
+			if not mapOk then
+				recordPipelineError("SERVER_RECONSTRUCTION", mapErr)
+			end
+		end
 
 		-- collect filtered and deduped; recover each extra's surviving roots.
 		for _, extra in pendingExtras do
@@ -6961,13 +7000,6 @@ local function synsaveinstance(...)
 			local readmeEntry = ctx.entries[readmeExtra.roots[1]]
 			if readmeEntry then
 				readmeEntry.deferLast = true -- emitBinary encodes this bucket after all others
-			end
-		end
-
-		if mapExtra then
-			local mapEntry = ctx.entries[mapExtra.roots[1]]
-			if mapEntry then
-				mapEntry.deferLast = true -- must run after every script's Source is known
 			end
 		end
 
