@@ -255,12 +255,12 @@ local function compileError(source)
 	if not LOADSTRING or #source > VALIDATE_MAX then
 		return nil
 	end
-	local ok, chunk = pcall(LOADSTRING, source)
+	local ok, chunk, err = pcall(LOADSTRING, source)
 	if ok and chunk then
 		return nil
 	end
 	if ok then
-		return "loadstring returned no chunk"
+		return tostring(err or "loadstring returned no chunk")
 	end
 	return tostring(chunk)
 end
@@ -5488,7 +5488,7 @@ local function synsaveinstance(...)
 		local scanned = 0
 
 		for _, instance in ctx.ordered do
-			if not instance:IsA("LuaSourceContainer") then
+			if typeof(instance) ~= "Instance" or not instance:IsA("LuaSourceContainer") then
 				continue
 			end
 
@@ -5567,7 +5567,7 @@ local function synsaveinstance(...)
 
 		local visibleServer = {}
 		for _, instance in ctx.ordered do
-			if instance:IsA("Script") and not instance:IsA("LocalScript") then
+			if typeof(instance) == "Instance" and instance:IsA("Script") and not instance:IsA("LocalScript") then
 				local ok, runContext = pcall(index, instance, "RunContext")
 				if ok and runContext == Enum.RunContext.Server then
 					visibleServer[#visibleServer + 1] = instance
