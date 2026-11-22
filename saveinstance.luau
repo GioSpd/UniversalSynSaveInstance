@@ -291,7 +291,28 @@ local function repairDanglingColon(source, err)
 	end
 
 	local lines = splitLines(source)
-	for i = lineNo, math.max(1, lineNo - 3), -1 do
+	local reported = lines[lineNo]
+
+	-- * Some builds report on the colon itself; only trust that when the colon
+	-- * really is the last thing on the line.
+	if reported then
+		local trimmed = string.gsub(reported, "%s+$", "")
+		local at = string.find(trimmed, ":%s*$")
+		if at then
+			lines[lineNo] = string.sub(trimmed, 1, at - 1)
+			return table.concat(lines, "\n")
+		end
+
+		-- * Same line: "obj: end" -> "obj end"
+		at = string.find(reported, ":%s+end%s*$")
+		if at then
+			lines[lineNo] = string.sub(reported, 1, at - 1) .. string.sub(reported, at + 1)
+			return table.concat(lines, "\n")
+		end
+	end
+
+	-- * Luau reports "got 'end'" on the end token, so the colon sits above it.
+	for i = lineNo - 1, math.max(1, lineNo - 3), -1 do
 		local line = lines[i]
 		local trimmed = string.gsub(line, "%s+$", "")
 		local at = string.find(trimmed, ":%s*$")
@@ -453,8 +474,79 @@ local function cleanSource(source)
 end
 
 -- * Returns source, status, error, repairs
-local function processDecompiledSource(source, options)
+-- * The whole response is one or more ":16: message" lines and nothing else:
+-- * the backend returned a parser diagnostic in place of source.
+local function isDiagnosticOnly(source)
+	local seen = false
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		if string.find(line, "%S") then
+			if not string.match(line, "^%s*:%d+:") then
+				return false
+			end
+			seen = true
+		end
+	end
+	return seen
+end
+
+-- * True when anything is left after dropping comments and blank lines. A
+-- * backend that dies mid-parse returns only its note, which is comment-only
+-- * and would otherwise compile and look healthy.
+local function hasCode(source)
+	local depth = 0
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		local i = 1
+		local len = #line
+		while i <= len do
+			if depth > 0 then
+				local closeAt = string.find(line, "]", i, true)
+				if not closeAt then
+					break
+				end
+				depth -= 1
+				i = closeAt + 1
+			else
+				local c = string.sub(line, i, i)
+				if c == " " or c == "\t" then
+					i += 1
+				elseif string.sub(line, i, i + 3) == "--[[" then
+					depth += 1
+					i += 4
+				elseif string.sub(line, i, i + 1) == "--" then
+					break
+				else
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+local function processDecompiledSource(source, options, name)
+	if isDiagnosticOnly(source) then
+		local note = string.match(source, ":%d+:[^\n]*") or "no diagnostic text"
+		local label = tostring(name or "script") .. " source unavailable in this export"
+		return "-- Original body: unavailable in this export (0 source bytes returned)"
+			.. "\n-- Backend diagnostic: " .. note
+			.. "\n-- Nothing was buffered before the backend parser stopped, so there is no"
+			.. "\n-- partial source to repair or quarantine. Referencing call sites are in"
+			.. "\n-- the Server Reconstruction tree."
+			.. "\nerror(" .. string.format("%q", label) .. ", 0)\n",
+			"diagnostic_only",
+			note
+	end
+
 	source = stripDecompilerNoise(source)
+
+	if not hasCode(source) then
+		local note = string.match(source, "decompiler said[^\n]*") or "no output"
+		return "-- " .. note
+			.. "\n\n-- Comment-only response with no diagnostic: the backend produced no code."
+			.. "\n-- Referencing call sites are in the Server Reconstruction tree.\n",
+			"comment_only",
+			note
+	end
 
 	if not options.Validate then
 		if options.Clean then
@@ -5276,7 +5368,7 @@ local function synsaveinstance(...)
 				local pipelineOk, pipelineErr = pcall(function()
 					result = escapeNuls(result)
 					local repairs
-					output, status, err, repairs = processDecompiledSource(result, processOptions)
+					output, status, err, repairs = processDecompiledSource(result, processOptions, script.Name)
 					if __DEBUG_MODE then
 						__DEBUG_MODE(
 							string.format("pipeline %.2fs %d bytes %s", os.clock() - startedAt, #result, status),
